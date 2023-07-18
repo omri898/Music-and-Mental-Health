@@ -1,0 +1,696 @@
+---
+title: "classification_model"
+output: html_document
+date: "2023-06-16"
+---
+
+**Section 2 - Classification Approach**
+
+```{r,include=FALSE}
+pkg <- c('dplyr', 'scales', 'tidyr', 'ggplot2', 'data.table', 'readr', 
+         'tidymodels', 'ranger', 'knitr', 'summarytools', 
+         'tidyverse', 'recipes', 'stats', 'janitor','cluster','car','pheatmap','randomForest','Boruta')
+
+check_and_install <- function(p) {
+  if(!require(p, character.only = TRUE)) {
+    install.packages(p, dependencies = TRUE)
+    library(p, character.only = TRUE)
+  }
+}
+
+sapply(pkg, check_and_install)
+
+```
+
+```{r,include=FALSE}
+# Load the datasets
+survey_data_classification <- read_csv("data/mxmh_survey_results.csv")
+spotify_data_classification <- read_csv("data/spotify.csv")
+```
+
+**Clean features name - using janitor**
+
+```{r,include=FALSE}
+survey_data_classification <- survey_data_classification %>%
+  clean_names()
+survey_data_classification <- rename(survey_data_classification, frequency_r_n_b = frequency_r_b)
+survey_data_classification <- select(survey_data_classification, -c(frequency_video_game_music, frequency_rap, frequency_lofi))
+```
+
+**Calculate attribute scores to each genre**
+
+```{r,include=FALSE}
+# Define the genres of interest
+genres_of_interest <- c("classical", "country", "edm", "folk", "gospel", "hip_hop", 
+                        "jazz", "k_pop", "latin", "metal", "pop", "r_n_b", "rock")
+features <- c("danceability", "energy",  "loudness", "speechiness",
+              "acousticness", "instrumentalness", "liveness", "valence", "tempo")
+
+# Filter spotify_data_classification for the genres of interest
+spotify_data_classification <- spotify_data_classification %>%
+  filter(track_genre %in% genres_of_interest)
+
+
+# Calculate mean for each genre in filtered_spotify_data_classification
+spotify_means <- spotify_data_classification %>%
+  group_by(track_genre) %>%
+  summarise(across(features, mean, na.rm = TRUE), .groups = 'drop')
+
+# Define the genre columns in survey_data
+genre_cols <- c("weight_classical", "weight_country", "weight_edm", "weight_folk", "weight_gospel",
+                "weight_hip_hop", "weight_jazz", "weight_k_pop", "weight_latin", "weight_metal",
+                "weight_pop", "weight_r_n_b", "weight_rock")
+
+spotify_means <- spotify_means %>%
+  mutate(track_genre = paste0("frequency_", track_genre))
+specific_genres <- c("classical", "country", "edm", "folk", "gospel", "hip_hop", "jazz", "k_pop", "latin", "metal", "pop", "r_n_b", "rock")
+# Create a list of genre columns in survey_data
+genre_cols <- paste0("frequency_", specific_genres)
+
+freq_map <- c("Never" = 0, "Rarely" = 0.33, "Sometimes" = 0.67, "Very frequently" = 1)
+
+survey_data_classification <- survey_data_classification %>%
+  mutate(across(starts_with("frequency_"), ~ freq_map[.])) 
+
+features <- c("danceability", "energy",  "loudness", "speechiness", "acousticness", "instrumentalness", "liveness", "valence","tempo")
+
+
+```
+
+```{r,include=FALSE}
+for (i in 1:nrow(survey_data_classification)) {
+  # Initialize variables
+  multi <- rep(0, length(features))
+  division <- 0
+  for (feature in features) {
+    multi <- rep(0, length(features))
+    division <- 0
+    for (genre_col in genre_cols) {
+      weight <- as.numeric(survey_data_classification[i, genre_col])* as.numeric(survey_data_classification[i, "hours_per_day"])
+      weights <- rep(weight, length(features))
+      
+      # Get genre means for the current genre and feature
+      genre_means <- as.numeric(unlist(spotify_means[spotify_means$track_genre == genre_col, feature]))
+
+      # Skip iteration if genre_means is empty
+      if (length(genre_means) == 0)
+        next
+      
+      # Multiply weight with each feature value and accumulate the sum
+      multi <- multi + (weights * genre_means)
+      
+      # Accumulate the weight in the division variable
+      division <- division + weight
+    }
+      # Create a vector of the same length as features, filled with the division value
+  divisions <- rep(division, length(features))
+  
+  # Calculate the weighted average
+  weighted_average <- ifelse(division == 0, 0, multi / divisions)
+  
+  # Add the weighted average to the survey_data
+  survey_data_classification[i, paste0(feature,"_score")] <- weighted_average
+  }
+}
+```
+
+**We will calculate the spearman corrolation between each score to each one of the mental health oridinally features**
+
+```{r}
+# Assuming your data frame is named survey_data_classification
+X_variables <- c('danceability_score', 'energy_score', 'loudness_score', 
+                 'speechiness_score', 'acousticness_score', 'instrumentalness_score',
+                 'liveness_score', 'valence_score', 'tempo_score')
+
+Y_variables <- c("ocd", "depression", "insomnia", "anxiety")
+
+# Initialize an empty data frame to store the correlation results
+correlation_results <- data.frame()
+
+# Calculate Spearman's rank correlation
+for (x in X_variables) {
+  for (y in Y_variables) {
+    correlation <- cor.test(survey_data_classification[[x]], survey_data_classification[[y]], method = "spearman")
+    result <- data.frame(
+      X_variable = x,
+      Y_variable = y,
+      correlation = correlation$estimate,
+      p_value = correlation$p.value
+    )
+    correlation_results <- rbind(correlation_results, result)
+  }
+}
+
+# Filter the results
+filtered_results <- correlation_results %>%
+  filter(p_value < 0.05)
+
+# Print the filtered results
+print(filtered_results)
+
+```
+
+**We can see that some of the music scores have correlation only with depression, we will focus on depression.**
+
+```{r}
+# set.seed(123)
+# 
+# clustering_function <- function(data, column, k) {
+#   # Prepare the data
+#   target_data <- data[[column]]
+#   
+#   # Perform k-means clustering
+#   kmeans_result <- kmeans(target_data, centers = k)
+#   
+#   # Determine the cut points
+#   breaks <- quantile(target_data, probs = seq(0, 1, length.out = k + 1))
+#   categories <- cut(target_data, breaks = breaks, labels = c("1", "2", "3"))
+#   
+#   # Print the ranges for each cluster
+#   for (i in 1:k) {
+#     range_start <- breaks[i]
+#     range_end <- breaks[i+1]
+#     cluster_label <- levels(categories)[i]
+#     cat("Cluster", i, ":", cluster_label, "(", range_start, "-", range_end, ")\n")
+#   }
+#   
+#   return(categories)
+# }
+# 
+# # Usage
+# depression_categories <- clustering_function(survey_data_classification, "depression", 3)
+# insomnia_categories <- clustering_function(survey_data_classification, "insomnia", 3)
+# anxiety_categories <- clustering_function(survey_data_classification, "anxiety", 3)
+
+
+
+```
+
+## We will split the data to see if the corellation will improve\*\*
+
+```{r,include=FALSE}
+# Creating the "low" tibble
+low_depression <- survey_data_classification %>% filter(depression <= 3)
+
+# Creating the "medium" tibble
+medium_depression <- survey_data_classification %>% filter(depression > 3 & depression <= 7)
+
+# Creating the "high" tibble
+high_depression <- survey_data_classification %>% filter(depression > 7)
+
+# Creating the "low" tibble
+low_insomnia <- survey_data_classification %>% filter(insomnia <= 3)
+
+# Creating the "medium" tibble
+medium_insomnia <- survey_data_classification %>% filter(insomnia > 3 & insomnia <= 7)
+
+# Creating the "high" tibble
+high_insomnia <- survey_data_classification %>% filter(insomnia > 7)
+
+# Creating the "low" tibble
+low_anxiety <- survey_data_classification %>% filter(anxiety <= 3)
+
+# Creating the "medium" tibble
+medium_anxiety <- survey_data_classification %>% filter(anxiety > 3 & anxiety <= 7)
+
+# Creating the "high" tibble
+high_anxiety <- survey_data_classification %>% filter(anxiety > 7)
+
+# Creating the "low" tibble
+low_ocd <- survey_data_classification %>% filter(ocd <= 3)
+
+# Creating the "medium" tibble
+medium_ocd <- survey_data_classification %>% filter(ocd > 3 & anxiety <= 7)
+
+# Creating the "high" tibble
+high_ocd <- survey_data_classification %>% filter(ocd > 7)
+
+```
+
+```{r}
+# List of features
+features_score <- c("danceability_score", "energy_score",  "loudness_score", "speechiness_score", "acousticness_score", "instrumentalness_score", "liveness_score", "valence_score", "tempo_score")
+
+# Empty dataframe to store results
+correlation_df <- data.frame()
+
+# List of dataframes
+dataframes <- list(low_depression = low_depression, 
+                   medium_depression = medium_depression, 
+                   high_depression = high_depression,
+                   low_insomnia = low_insomnia, 
+                   medium_insomnia = medium_insomnia, 
+                   high_insomnia = high_insomnia, 
+                   low_anxiety = low_anxiety, 
+                   medium_anxiety = medium_anxiety, 
+                   high_anxiety = high_anxiety,
+                   low_ocd = low_ocd, 
+                   medium_ocd = medium_ocd, 
+                   high_ocd = high_ocd)
+
+# Loop through each dataframe
+for (df_name in names(dataframes)) {
+  
+  # Extract condition from table name
+  condition <- strsplit(df_name, "_")[[1]][2]
+  
+  # Loop through each feature
+  for (feature in features_score) {
+    
+    # Perform Spearman correlation test
+    result <- cor.test(dataframes[[df_name]][[feature]], dataframes[[df_name]][[condition]], method = "spearman")
+
+    # Check if p-value is less than 0.05
+    if (result$p.value < 0.05) {
+      
+      # If p-value is less than 0.05, add result to correlation_df
+      correlation_df <- rbind(correlation_df, data.frame(TableName = df_name, Feature = feature, Correlation = result$estimate, P_Value = result$p.value))
+    }
+  }
+}
+
+# Print the correlation_df dataframe
+print(correlation_df)
+
+
+```
+
+
+```{r}
+# Split the data into training and testing datasets
+set.seed(123)
+data_split <- initial_split(survey_data_classification, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+```
+
+**Now, lets split each mental health feature to categories and factor it**
+
+```{r}
+
+train_data <- train_data %>%
+  mutate(
+    depression = as.factor(ifelse(depression > 7, 3, ifelse(depression > 3, 2, 1))),
+    ocd = as.factor(ifelse(ocd >= 7, 3, ifelse(ocd >= 3, 2, 1))),
+    insomnia = as.factor(ifelse(insomnia >= 5, 3, ifelse(insomnia > 2, 2, 1))),
+    anxiety = as.factor(ifelse(anxiety > 7, 3, ifelse(anxiety >5, 2, 1)))
+  )
+
+test_data <- test_data %>%
+  mutate(
+    depression = as.factor(ifelse(depression > 7, 3, ifelse(depression > 3, 2, 1))),
+    ocd = as.factor(ifelse(ocd >= 7, 3, ifelse(ocd >= 3, 2, 1))),
+    insomnia = as.factor(ifelse(insomnia >= 5, 3, ifelse(insomnia > 2, 2, 1))),
+    anxiety = as.factor(ifelse(anxiety > 7, 3, ifelse(anxiety >5, 2, 1)))
+  )
+```
+
+**Use chisq for feature selection. we show the features we want to remove from the model**
+
+```{r}
+
+# list all the categorical variables
+categorical_vars <- c("primary_streaming_service", "while_working", "instrumentalist", "composer", "fav_genre", "exploratory", "foreign_languages", 
+                      "frequency_classical", "frequency_country", "frequency_edm", "frequency_folk", "frequency_gospel", 
+                      "frequency_hip_hop", "frequency_jazz", "frequency_k_pop", "frequency_latin", "frequency_metal", 
+                      "frequency_pop", "frequency_r_n_b", "frequency_rock")
+
+# initialize an empty vector to store p-values
+p_values <- c()
+
+# loop over each categorical variable
+for (var in categorical_vars) {
+
+  # perform chi-square test
+  chi_test <- chisq.test(train_data[[var]], train_data$depression)
+  # store the p-value
+  p_values <- c(p_values, chi_test$p.value)
+}
+
+# create a data frame to view variable names and their corresponding p-values
+chi_results <- data.frame(Variables = categorical_vars, P_Value = p_values)
+
+# Check which features' p_value are greater than 0.05 (the alpha)
+chi_results_filtered <- chi_results %>% filter(P_Value > 0.05)
+
+chi_results_filtered
+```
+
+```{r}
+set.seed(123)
+
+# Define a function to run the model
+run_model <- function(train_data, test_data, target_variable, rec) {
+  # Specify the model to use
+  model_spec <- 
+    rand_forest(trees = 1000, min_n = tune()) %>%
+    set_engine("ranger", importance = 'impurity') %>%
+    set_mode("classification")
+
+  # Combine the model and recipe into a workflow
+  workflow <- 
+    workflow() %>%
+    add_recipe(rec) %>%
+    add_model(model_spec)
+
+  # Define a cross-validation plan
+  cv <- vfold_cv(train_data, v = 5, strata = target_variable)
+
+  # Tune the model
+  tuned_wf <- tune_grid(
+    workflow,
+    resamples = cv,
+    grid = 10,
+    control = control_grid(verbose = FALSE)
+  )
+
+  # Extract the best parameters
+  best_params <- tuned_wf %>% select_best("accuracy")
+
+  # Update the workflow with the best parameters
+  final_wf <- workflow %>% finalize_workflow(best_params)
+
+  # Fit the final workflow on the training data
+  final_fit <- final_wf %>% fit(train_data)
+
+  # Apply to the testing data
+  results <- final_fit %>%
+    predict(test_data) %>%
+    bind_cols(test_data[target_variable])
+
+  return(results)
+}
+```
+
+**Run the classification model to predict depression level**
+
+```{r}
+rec_depression <- recipe(depression ~ ., data = train_data) %>%
+  step_impute_mode(instrumentalist,while_working,music_effects,foreign_languages,primary_streaming_service,fav_genre ) %>%
+  step_impute_median(age,bpm) %>%
+  step_rm(timestamp, permissions, anxiety, ocd, insomnia, while_working, instrumentalist, composer,
+          exploratory, frequency_classical,frequency_folk, frequency_gospel, frequency_jazz, frequency_k_pop,
+          frequency_pop, frequency_country, primary_streaming_service, frequency_r_n_b,
+          "loudness_score", "speechiness_score", "liveness_score",
+          "valence_score", "instrumentalness_score","danceability_score") %>%
+  step_mutate(music_effects = as.factor(ifelse(music_effects %in% c("Worsen", "Improve"), 1, 0))) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors())
+# Run the model for depression
+depression_results <- run_model(train_data, test_data, "depression", rec_depression)
+
+cm <- conf_mat(depression_results, truth = depression, estimate = .pred_class)
+f1_score <- f_meas(depression_results, truth = depression, estimate = .pred_class)
+precision_score <- precision(depression_results, truth = depression, estimate = .pred_class)
+recall_score <- recall(depression_results, truth = depression, estimate = .pred_class)
+accuracy_score <- accuracy(depression_results, truth = depression, estimate = .pred_class)
+
+print(cm)
+
+cat("\n\nF1 Score: ", f1_score$.estimate, "\n")
+cat("Precision: ", precision_score$.estimate, "\n")
+cat("Recall: ", recall_score$.estimate, "\n")
+cat("Accuracy: ", accuracy_score$.estimate, "\n")
+```
+
+**Run the classification model to predict insomnia level**
+
+```{r}
+rec_insomnia <- recipe(insomnia ~ ., data = train_data) %>%
+  step_impute_mode(instrumentalist,while_working,music_effects,foreign_languages,primary_streaming_service,fav_genre ) %>%
+  step_impute_median(age,bpm) %>%
+  step_rm(timestamp, permissions, anxiety, ocd, depression, while_working, instrumentalist, composer,
+          exploratory, frequency_classical,frequency_folk, frequency_gospel, frequency_jazz, frequency_k_pop,
+          frequency_pop, frequency_country, primary_streaming_service, frequency_r_n_b,"speechiness_score", "liveness_score","valence_score", "danceability_score") %>%
+  step_mutate(music_effects = as.factor(ifelse(music_effects %in% c("Worsen", "Improve"), 1, 0))) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors())
+# Run the model for depression
+insomnia_results <- run_model(train_data, test_data, "insomnia", rec_insomnia)
+
+cm <- conf_mat(insomnia_results, truth = insomnia, estimate = .pred_class)
+f1_score <- f_meas(insomnia_results, truth = insomnia, estimate = .pred_class)
+precision_score <- precision(insomnia_results, truth = insomnia, estimate = .pred_class)
+recall_score <- recall(insomnia_results, truth = insomnia, estimate = .pred_class)
+accuracy_score <- accuracy(insomnia_results, truth = insomnia, estimate = .pred_class)
+
+print(cm)
+
+cat("\n\nF1 Score: ", f1_score$.estimate, "\n")
+cat("Precision: ", precision_score$.estimate, "\n")
+cat("Recall: ", recall_score$.estimate, "\n")
+cat("Accuracy: ", accuracy_score$.estimate, "\n")
+```
+
+**Run the classification model to predict anxiety level**
+
+```{r}
+rec_anxiety <- recipe(anxiety ~ ., data = train_data) %>%
+  step_impute_mode(instrumentalist,while_working,music_effects,foreign_languages,primary_streaming_service,fav_genre ) %>%
+  step_impute_median(age,bpm) %>%
+  step_rm(timestamp, permissions, ocd, insomnia, depression, while_working, instrumentalist, composer,
+          exploratory, frequency_classical,frequency_folk, frequency_gospel, frequency_jazz, frequency_k_pop,
+          frequency_pop, frequency_country, primary_streaming_service, frequency_r_n_b,"loudness_score", "liveness_score",
+          "valence_score", "instrumentalness_score","danceability_score") %>%
+  step_mutate(music_effects = as.factor(ifelse(music_effects %in% c("Worsen", "Improve"), 1, 0))) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors())
+# Run the model for depression
+anxiety_results <- run_model(train_data, test_data, "anxiety", rec_anxiety)
+
+cm <- conf_mat(anxiety_results, truth = anxiety, estimate = .pred_class)
+f1_score <- f_meas(anxiety_results, truth = anxiety, estimate = .pred_class)
+precision_score <- precision(anxiety_results, truth = anxiety, estimate = .pred_class)
+recall_score <- recall(anxiety_results, truth = anxiety, estimate = .pred_class)
+accuracy_score <- accuracy(anxiety_results, truth = anxiety, estimate = .pred_class)
+
+print(cm)
+
+cat("\n\nF1 Score: ", f1_score$.estimate, "\n")
+cat("Precision: ", precision_score$.estimate, "\n")
+cat("Recall: ", recall_score$.estimate, "\n")
+cat("Accuracy: ", accuracy_score$.estimate, "\n")
+```
+
+**Run the classification model to predict OCD level**
+
+```{r}
+rec_ocd <- recipe(ocd ~ ., data = train_data) %>%
+  step_impute_mode(instrumentalist,while_working,music_effects,foreign_languages,primary_streaming_service,fav_genre ) %>%
+  step_impute_median(age,bpm) %>%
+  step_rm(timestamp, permissions, anxiety, insomnia, depression, while_working, instrumentalist, composer,
+          exploratory, frequency_classical,frequency_folk, frequency_gospel, frequency_jazz, frequency_k_pop,
+          frequency_pop, frequency_country, primary_streaming_service, frequency_r_n_b,"loudness_score", "liveness_score",
+          "valence_score", "instrumentalness_score","danceability_score") %>%
+  step_mutate(music_effects = as.factor(ifelse(music_effects %in% c("Worsen", "Improve"), 1, 0))) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors())
+# Run the model for depression
+ocd_results <- run_model(train_data, test_data, "ocd", rec_ocd)
+
+cm <- conf_mat(ocd_results, truth = ocd, estimate = .pred_class)
+f1_score <- f_meas(ocd_results, truth = ocd, estimate = .pred_class)
+precision_score <- precision(ocd_results, truth = ocd, estimate = .pred_class)
+recall_score <- recall(ocd_results, truth = ocd, estimate = .pred_class)
+accuracy_score <- accuracy(ocd_results, truth = ocd, estimate = .pred_class)
+
+print(cm)
+
+cat("\n\nF1 Score: ", f1_score$.estimate, "\n")
+cat("Precision: ", precision_score$.estimate, "\n")
+cat("Recall: ", recall_score$.estimate, "\n")
+cat("Accuracy: ", accuracy_score$.estimate, "\n")
+```
+
+## getting insights on each category group for depression
+
+```{r}
+cleaned_data <- na.omit(survey_data_classification)
+
+# Creating the "low" tibble
+low_depression <- cleaned_data %>% filter(depression <= 3)
+
+# Creating the "medium" tibble
+medium_depression <- cleaned_data %>% filter(depression >= 4 & depression <= 7)
+
+# Creating the "high" tibble
+high_depression <- cleaned_data %>% filter(depression >= 8)
+```
+
+
+```{r}
+test_variance <- function(group1, group2) {
+  combined_data <- bind_rows(
+    group1 %>% mutate(group = 'group1'),
+    group2 %>% mutate(group = 'group2')) %>%
+    select(-one_of("depression", "anxiety", "ocd", "insomnia"))
+  
+  # List to store ANOVA results
+  anova_results <- list()
+  
+  # Iterate over each numerical variable
+  numerical_variables <- colnames(combined_data)[sapply(combined_data, is.numeric)]
+  for (var in numerical_variables) {
+    formula <- as.formula(paste(var, " ~ group"))
+    anova_results[[var]] <- aov(formula, data = combined_data)
+  }
+  
+  # Print ANOVA results
+  for (var in numerical_variables) {
+    print(var)
+    print(summary(anova_results[[var]]))
+  }
+}
+
+```
+
+**variance test between "low_depression" and "medium_depression"**
+
+```{r}
+test_variance(low_depression, medium_depression)
+```
+
+**variance test between "medium_depression" and "high_depression"**
+
+```{r}
+test_variance(medium_depression, high_depression)
+
+```
+
+
+
+**variance test between "low_depression" and "high_depression"**
+
+```{r}
+test_variance(low_depression, high_depression)
+```
+
+**Now we will test another approach**
+
+```{r}
+# Split the data into training and testing datasets
+set.seed(123)
+data_split <- initial_split(survey_data_classification, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+```
+
+**Create a new binary feature which is 1 if the sum of exp of ocd,anxiety,insomnia,depression is greater than e\^6,otherwise 0**
+
+```{r}
+train_data <- train_data %>%
+  mutate(
+    mental_health = as.factor(ifelse((exp(ocd) + exp(anxiety) + exp(insomnia) + exp(depression)) >= 2 * exp(6), 1, 0))
+  )
+
+test_data <- test_data %>%
+  mutate(
+    mental_health = as.factor(ifelse((exp(ocd) + exp(anxiety) + exp(insomnia) + exp(depression)) >= 2 * exp(6), 1, 0))
+  )
+```
+
+**Feture Selection using boruta algorithm**
+
+```{r}
+data <- train_data
+data <- data[, !(names(data) %in% c("anxiety", "depression", "insomnia", "ocd"))]
+
+data <- na.omit(data)
+
+categorical_features <- c('primary_streaming_service', 'while_working', 'instrumentalist', 'composer', 'fav_genre', 'exploratory', 'foreign_languages')
+
+for(col in categorical_features){
+  data[[col]] <- as.factor(data[[col]])
+}
+X <- data[, -which(names(data) %in% "mental_health")]
+y <- as.factor(data$mental_health)  # convert target to factor
+set.seed(123)  # for reproducibility
+
+# Apply Boruta feature selection method
+boruta_output <- Boruta(X, y, doTrace=2)  # doTrace=2 for some logs to see progress
+
+# Handle the tentative variables
+boruta_output <- TentativeRoughFix(boruta_output)
+
+# Get finalized important variables
+final_vars <- getSelectedAttributes(boruta_output, withTentative = F)
+
+print(final_vars)
+```
+
+```{r}
+set.seed(123)
+
+# Define a function to run the model
+run_model <- function(train_data, test_data, target_variable, rec) {
+  # Specify the model to use
+  model_spec <- 
+    rand_forest(trees = 1000, min_n = tune()) %>%
+    set_engine("ranger", importance = 'impurity') %>%
+    set_mode("classification")
+
+  # Combine the model and recipe into a workflow
+  workflow <- 
+    workflow() %>%
+    add_recipe(rec) %>%
+    add_model(model_spec)
+
+  # Define a cross-validation plan
+  cv <- vfold_cv(train_data, v = 5, strata = target_variable)
+
+  # Tune the model
+  tuned_wf <- tune_grid(
+    workflow,
+    resamples = cv,
+    grid = 10,
+    control = control_grid(verbose = FALSE)
+  )
+
+  # Extract the best parameters
+  best_params <- tuned_wf %>% select_best("accuracy")
+
+  # Update the workflow with the best parameters
+  final_wf <- workflow %>% finalize_workflow(best_params)
+
+  # Fit the final workflow on the training data
+  final_fit <- final_wf %>% fit(train_data)
+
+  # Apply to the testing data
+  results <- final_fit %>%
+    predict(test_data) %>%
+    bind_cols(test_data[target_variable])
+
+  return(results)
+}
+
+
+```
+
+**Run Overall mental helath clasffication method**
+
+```{r}
+
+rec_mental_health <- recipe(mental_health ~ age+hours_per_day+frequency_rock+danceability_score+energy_score+loudness_score+acousticness_score+instrumentalness_score+tempo_score, data = train_data) %>%
+  step_impute_median(age,hours_per_day) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors())
+
+mental_health_results <- run_model(train_data, test_data, "mental_health", rec_mental_health)
+
+mental_health_results <- mental_health_results %>%
+  mutate(mental_health = factor(mental_health, levels=c(1,0))) %>%
+  mutate(.pred_class = factor(.pred_class, levels=c(1,0)))
+
+cm <- conf_mat(mental_health_results, truth = mental_health, estimate = .pred_class)
+f1_score <- f_meas(mental_health_results, truth = mental_health, estimate = .pred_class)
+precision_score <- precision(mental_health_results, truth = mental_health, estimate = .pred_class)
+recall_score <- recall(mental_health_results, truth = mental_health, estimate = .pred_class)
+accuracy_score <- accuracy(mental_health_results, truth = mental_health, estimate = .pred_class)
+
+print(cm)
+
+cat("\n\nF1 Score: ", f1_score$.estimate, "\n")
+cat("Precision: ", precision_score$.estimate, "\n")
+cat("Recall: ", recall_score$.estimate, "\n")
+cat("Accuracy: ", accuracy_score$.estimate, "\n")
+```
